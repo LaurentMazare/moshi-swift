@@ -46,7 +46,8 @@ class Depformer: Module {
     }
 
     public func sample(
-        mainTransformerOut: MLXArray, stepIdx: Int, sampler: Sampler, textToken: MLXArray
+        mainTransformerOut: MLXArray, stepIdx: Int, sampler: Sampler, textToken: MLXArray,
+        codes: MLXArray
     ) -> MLXArray {
         for c in self.transformerCache {
             c.reset()
@@ -57,12 +58,16 @@ class Depformer: Module {
             if sliceIdx != 0 && stepIdx < self.cfg.audioDelays[sliceIdx - 1] {
                 lastToken = MLXArray([self.cfg.audioPaddingToken()])
             }
+            print("LT", lastToken)
             var xs = slice.linearIn(mainTransformerOut) + slice.emb(lastToken)
             xs = slice.transformer(xs, cache: self.transformerCache)
             let logits = slice.linearOut(xs)
+            print("AL", logits)
             (lastToken, _) = sampler(logits: logits[0])
+            lastToken = codes[sliceIdx].reshaped([1])
             tokens.append(lastToken)
         }
+        print(tokens)
         return concatenated(tokens)
     }
 }
@@ -257,6 +262,7 @@ public class LM: Module {
     @ModuleInfo(key: "out_norm") var outNorm: UnaryLayer
     @ModuleInfo(key: "text_linear") var textLinear: Linear
     @ModuleInfo(key: "audio_embs") var audioEmbs: [Embedding]
+    let codes: MLXArray
 
     public init(_ cfg: LmConfig, bSize: Int) {
         self.cfg = cfg
@@ -276,6 +282,9 @@ public class LM: Module {
             Embedding(embeddingCount: cfg.audioVocabSize, dimensions: cfg.transformer.dModel)
         }
         self.transformerCache = self._transformer.wrappedValue.makeCache(bSize: bSize)
+        let arr = try! loadArrays(
+            url: URL(fileURLWithPath: "/Users/laurent/tmp/codes.safetensors"))
+        self.codes = arr["codes"]!
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -309,16 +318,27 @@ public class LM: Module {
         audioSampler: Sampler,
         cb: Callbacks
     ) -> (MLXArray, MLXArray) {
+        let textIds: MLXArray? = self.codes[0, 0, stepIdx].reshaped([1, 1])
+        let audioIds = (0..<16).map {
+            self.codes[0, 1 + $0, stepIdx].reshaped([1, 1])
+        }
         cb.onEvent(.beginStep)
         var x = textIds.flatMap { textEmb($0) }
         for (a, emb) in zip(audioIds, self.audioEmbs) {
             let e = emb(a)
             x = x.map { $0 + e } ?? e
         }
+        print("STEP", stepIdx)
+        print("SEQ", textIds)
+        print("AIDS", audioIds.map { $0.item(Int.self) })
         let mainTransformerOut = outNorm(transformer(x!, cache: self.transformerCache))
         let textLogits = textLinear(mainTransformerOut[0..., -1, 0...])
-        let (textToken, _) = textSampler(logits: textLogits)
+        print("LOGITS", textLogits)
+        var (textToken, _) = textSampler(logits: textLogits)
         textToken.eval()
+        print("TT", textToken)
+        textToken = self.codes[0, 0, stepIdx + 1]
+        print("TF-TT", textToken)
         cb.onEvent(.endStep)
         if let depformer = self.depformer {
             cb.onEvent(.beginDepformer)
@@ -326,8 +346,10 @@ public class LM: Module {
                 mainTransformerOut: mainTransformerOut,
                 stepIdx: stepIdx,
                 sampler: audioSampler,
-                textToken: textToken)
+                textToken: textToken,
+                codes: self.codes[0, 1..., stepIdx + 1])
             audioTokens.eval()
+            print("AT", audioTokens)
             cb.onEvent(.endDepformer)
             return (textToken, audioTokens)
         } else {
